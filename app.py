@@ -2,15 +2,19 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+import joblib
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve
+from sklearn.model_selection import train_test_split
+
+from train_model import (
+    COLUMNS_PATH,
+    ENCODERS_PATH,
+    MODEL_PATH,
+    SCALER_PATH,
+    preparar_datos_app
+)
 
 
 st.set_page_config(
@@ -99,183 +103,89 @@ def cargar_datos():
     return pd.read_csv("Leads.csv")
 
 
-@st.cache_data
-def entrenar_modelos(df_original):
-    df = df_original.copy()
+@st.cache_resource
+def cargar_artifactos():
+    paths = [MODEL_PATH, SCALER_PATH, ENCODERS_PATH, COLUMNS_PATH]
+    missing = [str(path) for path in paths if not path.exists()]
 
-    if "Converted" not in df.columns:
-        st.error("No se encontró la columna objetivo 'Converted' en el dataset.")
+    if missing:
+        st.error(
+            "Faltan archivos del modelo. Ejecuta primero: python train_model.py"
+        )
         st.stop()
 
-    ids = pd.DataFrame(index=df.index)
-
-    if "Lead Number" in df.columns:
-        ids["Lead Number"] = df["Lead Number"]
-
-    if "Prospect ID" in df.columns:
-        ids["Prospect ID"] = df["Prospect ID"]
-
-    columnas_no_modelo = ["Prospect ID", "Lead Number"]
-    df_modelo = df.drop(columns=[c for c in columnas_no_modelo if c in df.columns])
-
-    porcentaje_nulos = (df_modelo.isnull().sum() / len(df_modelo)) * 100
-    columnas_muchos_nulos = porcentaje_nulos[porcentaje_nulos > 40].index.tolist()
-
-    if "Converted" in columnas_muchos_nulos:
-        columnas_muchos_nulos.remove("Converted")
-
-    df_modelo = df_modelo.drop(columns=columnas_muchos_nulos)
-
-    X = df_modelo.drop("Converted", axis=1)
-    y = df_modelo["Converted"]
-
-    columnas_numericas = X.select_dtypes(include=["int64", "float64"]).columns
-    columnas_categoricas = X.select_dtypes(include=["object"]).columns
-
-    procesador = ColumnTransformer(
-        transformers=[
-            (
-                "num",
-                Pipeline(steps=[
-                    ("imputer", SimpleImputer(strategy="median")),
-                    ("scaler", StandardScaler())
-                ]),
-                columnas_numericas
-            ),
-            (
-                "cat",
-                Pipeline(steps=[
-                    ("imputer", SimpleImputer(strategy="most_frequent")),
-                    ("onehot", OneHotEncoder(handle_unknown="ignore"))
-                ]),
-                columnas_categoricas
-            )
-        ]
-    )
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y
-    )
-
-    modelos = {
-        "Regresión Logística": LogisticRegression(max_iter=1000),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200,
-            random_state=42,
-            max_depth=12,
-            class_weight="balanced"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", InconsistentVersionWarning)
+        return (
+            joblib.load(MODEL_PATH),
+            joblib.load(SCALER_PATH),
+            joblib.load(ENCODERS_PATH),
+            joblib.load(COLUMNS_PATH)
         )
+
+
+def nombre_modelo(model):
+    nombres = {
+        "RandomForestClassifier": "Random Forest",
+        "LogisticRegression": "Regresión Logística"
     }
+    return nombres.get(type(model).__name__, type(model).__name__)
 
-    resultados = []
 
-    modelos_entrenados = {}
-
-    for nombre, modelo in modelos.items():
-        pipeline = Pipeline(steps=[
-            ("procesador", procesador),
-            ("modelo", modelo)
-        ])
-
-        pipeline.fit(X_train, y_train)
-
-        y_pred = pipeline.predict(X_test)
-        y_prob = pipeline.predict_proba(X_test)[:, 1]
-
-        resultados.append({
-            "Modelo": nombre,
-            "Accuracy": accuracy_score(y_test, y_pred),
-            "ROC-AUC": roc_auc_score(y_test, y_prob)
-        })
-
-        modelos_entrenados[nombre] = {
-            "pipeline": pipeline,
-            "y_pred": y_pred,
-            "y_prob": y_prob
-        }
-
-    resultados_df = pd.DataFrame(resultados).sort_values(
-        by="ROC-AUC",
-        ascending=False
-    )
-
-    mejor_modelo_nombre = resultados_df.iloc[0]["Modelo"]
-    mejor_modelo = modelos_entrenados[mejor_modelo_nombre]["pipeline"]
-    y_pred_best = modelos_entrenados[mejor_modelo_nombre]["y_pred"]
-    y_prob_best = modelos_entrenados[mejor_modelo_nombre]["y_prob"]
-
-    lead_scores = mejor_modelo.predict_proba(X)[:, 1]
-
-    ranking = ids.copy()
-
-    if ranking.empty:
-        ranking["Lead"] = range(1, len(df_original) + 1)
-
-    ranking["Probabilidad Conversión (%)"] = (lead_scores * 100).round(2)
-    ranking["Lead_Score"] = lead_scores
-
-    def asignar_prioridad(score):
-        if score >= 0.80:
-            return "Alta"
-        elif score >= 0.50:
-            return "Media"
-        else:
-            return "Baja"
-
-    ranking["Prioridad"] = ranking["Lead_Score"].apply(asignar_prioridad)
-
-    if mejor_modelo_nombre == "Random Forest":
-        try:
-            feature_names = mejor_modelo.named_steps["procesador"].get_feature_names_out()
-            importancias = mejor_modelo.named_steps["modelo"].feature_importances_
-
-            importance = pd.DataFrame({
-                "Variable": feature_names,
-                "Importancia": importancias
-            }).sort_values(by="Importancia", ascending=False)
-
-            importance["Variable"] = (
-                importance["Variable"]
-                .str.replace("num__", "", regex=False)
-                .str.replace("cat__", "", regex=False)
-            )
-        except Exception:
-            importance = pd.DataFrame(columns=["Variable", "Importancia"])
-    else:
-        importance = pd.DataFrame(columns=["Variable", "Importancia"])
-
-    return (
-        ranking,
-        resultados_df,
-        mejor_modelo_nombre,
-        y_test,
-        y_pred_best,
-        y_prob_best,
-        importance,
-        columnas_muchos_nulos
-    )
+def asignar_prioridad(score):
+    if score >= 0.80:
+        return "Alta"
+    if score >= 0.50:
+        return "Media"
+    return "Baja"
 
 
 df_original = cargar_datos()
+model, scaler, _label_encoder, feature_columns = cargar_artifactos()
 
-(
-    ranking,
-    resultados_df,
-    mejor_modelo_nombre,
-    y_test,
-    y_pred,
-    y_prob,
-    importance,
-    columnas_eliminadas
-) = entrenar_modelos(df_original)
+try:
+    df_modelo, X_scaled, y, columnas_eliminadas = preparar_datos_app(
+        df_original,
+        scaler,
+        feature_columns
+    )
+except Exception as exc:
+    st.error(f"No se pudieron preparar los datos para el modelo: {exc}")
+    st.stop()
 
+_, X_test, _, y_test = train_test_split(
+    X_scaled,
+    y,
+    test_size=0.2,
+    random_state=42
+)
 
-accuracy = resultados_df.iloc[0]["Accuracy"]
-auc = resultados_df.iloc[0]["ROC-AUC"]
+y_pred = model.predict(X_test)
+y_prob = model.predict_proba(X_test)[:, 1]
+lead_scores = model.predict_proba(X_scaled)[:, 1]
+
+accuracy = accuracy_score(y_test, y_pred)
+auc = roc_auc_score(y_test, y_prob)
+mejor_modelo_nombre = nombre_modelo(model)
+
+resultados_df = pd.DataFrame([{
+    "Modelo": mejor_modelo_nombre,
+    "Accuracy": accuracy,
+    "ROC-AUC": auc
+}])
+
+ranking = df_modelo.copy()
+ranking["Lead_Score"] = lead_scores
+ranking["Probabilidad Conversión (%)"] = (lead_scores * 100).round(2)
+ranking["Prioridad"] = ranking["Lead_Score"].apply(asignar_prioridad)
+
+if hasattr(model, "feature_importances_"):
+    importance = pd.DataFrame({
+        "Variable": feature_columns,
+        "Importancia": model.feature_importances_
+    }).sort_values(by="Importancia", ascending=False)
+else:
+    importance = pd.DataFrame(columns=["Variable", "Importancia"])
 
 total_leads = len(ranking)
 alta = ranking[ranking["Prioridad"] == "Alta"].shape[0]
@@ -381,7 +291,7 @@ with c1:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
 
 with c2:
     st.subheader("Comparación de modelos")
@@ -405,7 +315,7 @@ with c2:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
 
 with c3:
     st.subheader("Resumen técnico")
@@ -455,6 +365,8 @@ ranking_filtrado = ranking_filtrado.sort_values(
     by="Lead_Score",
     ascending=False
 )
+ranking_filtrado = ranking_filtrado.reset_index(drop=True)
+ranking_filtrado["Lead"] = ranking_filtrado.index + 1
 
 st.caption(
     "Cuando seleccionas 'Todas', la tabla se ordena por probabilidad de conversión. "
@@ -474,7 +386,7 @@ columnas_tabla += [
 
 st.dataframe(
     ranking_filtrado[columnas_tabla].head(cantidad_mostrar),
-    use_container_width=True,
+    width="stretch",
     hide_index=True
 )
 
@@ -515,7 +427,7 @@ with e1:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
 
 with e2:
     st.subheader("Matriz de confusión")
@@ -539,7 +451,7 @@ with e2:
     ax.set_ylabel("Valor real", color="white")
     ax.tick_params(colors="white")
 
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
 
 
 if not importance.empty:
@@ -567,7 +479,7 @@ if not importance.empty:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
 
 
 st.divider()
@@ -575,14 +487,14 @@ st.divider()
 with st.expander("Ver comparación completa de modelos"):
     st.dataframe(
         resultados_df.round(4),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
 with st.expander("Ver muestra del dataset original"):
     st.dataframe(
         df_original.head(20),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
